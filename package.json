@@ -1,0 +1,11 @@
+{
+  "name": "pi-kanboard",
+  "version": "0.1.0",
+  "description": "Scoped Kanboard (kanban) tools for pi with automatic project_id injection",
+  "license": "MIT",
+  "author": "urec56",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  }
+}

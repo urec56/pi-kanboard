@@ -66,6 +66,7 @@ Fallbacks and errors:
 | --- | --- |
 | `kanban_board` | Active board (name, project_id, url) + resolved acting user (`as`) + columns + swimlanes |
 | `kanban_list_tasks` | List tasks (open/closed) or search by `query` |
+| `kanban_my_tasks` | List tasks assigned to the resolved Kanboard user of the current session/agent (open by default) |
 | `kanban_get_task` | Get one task by `task_id` |
 | `kanban_create_task` | Create a task, returns `task_id` |
 | `kanban_update_task` | Update task fields (only provided ones) |

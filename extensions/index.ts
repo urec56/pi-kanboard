@@ -359,7 +359,25 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_list_tasks"),
 	});
 
-	// 3. kanban_get_task
+	// 3. kanban_my_tasks
+	pi.registerTool({
+		name: "kanban_my_tasks",
+		label: "Kanban My Tasks",
+		description: `List tasks on the active board assigned to the resolved Kanboard user of the current session/agent (see "as" in kanban_board; default is the registry user). ${boardNote}`,
+		promptSnippet: "List my own Kanboard tasks on the active board",
+		parameters: Type.Object({
+			status: Type.Optional(StringEnum(["open", "closed"] as const)),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const bc = resolveBoard(ctx.cwd);
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const all = (await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 })) as Array<Record<string, unknown>>;
+			return toolResult(all.filter((t) => Number(t.owner_id) === id.user_id));
+		},
+		...renderersFor("kanban_my_tasks"),
+	});
+
+	// 4. kanban_get_task
 	pi.registerTool({
 		name: "kanban_get_task",
 		label: "Kanban Get Task",
@@ -374,7 +392,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_get_task"),
 	});
 
-	// 4. kanban_create_task
+	// 5. kanban_create_task
 	pi.registerTool({
 		name: "kanban_create_task",
 		label: "Kanban Create Task",
@@ -407,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_create_task"),
 	});
 
-	// 5. kanban_update_task
+	// 6. kanban_update_task
 	pi.registerTool({
 		name: "kanban_update_task",
 		label: "Kanban Update Task",
@@ -437,7 +455,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_update_task"),
 	});
 
-	// 6. kanban_move_task
+	// 7. kanban_move_task
 	pi.registerTool({
 		name: "kanban_move_task",
 		label: "Kanban Move Task",
@@ -476,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_move_task"),
 	});
 
-	// 7. kanban_close_task
+	// 8. kanban_close_task
 	pi.registerTool({
 		name: "kanban_close_task",
 		label: "Kanban Close Task",
@@ -491,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_close_task"),
 	});
 
-	// 8. kanban_reopen_task
+	// 9. kanban_reopen_task
 	pi.registerTool({
 		name: "kanban_reopen_task",
 		label: "Kanban Reopen Task",
@@ -506,7 +524,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_reopen_task"),
 	});
 
-	// 9. kanban_add_comment
+	// 10. kanban_add_comment
 	pi.registerTool({
 		name: "kanban_add_comment",
 		label: "Kanban Add Comment",
@@ -526,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_add_comment"),
 	});
 
-	// 10. kanban_list_comments
+	// 11. kanban_list_comments
 	pi.registerTool({
 		name: "kanban_list_comments",
 		label: "Kanban List Comments",
@@ -541,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_list_comments"),
 	});
 
-	// 11. kanban_add_subtask
+	// 12. kanban_add_subtask
 	pi.registerTool({
 		name: "kanban_add_subtask",
 		label: "Kanban Add Subtask",
@@ -568,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_add_subtask"),
 	});
 
-	// 12. kanban_list_subtasks
+	// 13. kanban_list_subtasks
 	pi.registerTool({
 		name: "kanban_list_subtasks",
 		label: "Kanban List Subtasks",
@@ -583,7 +601,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_list_subtasks"),
 	});
 
-	// 13. kanban_update_subtask
+	// 14. kanban_update_subtask
 	pi.registerTool({
 		name: "kanban_update_subtask",
 		label: "Kanban Update Subtask",
@@ -611,7 +629,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_update_subtask"),
 	});
 
-	// 14. kanban_list_columns
+	// 15. kanban_list_columns
 	pi.registerTool({
 		name: "kanban_list_columns",
 		label: "Kanban List Columns",
@@ -626,7 +644,7 @@ export default function (pi: ExtensionAPI) {
 		...renderersFor("kanban_list_columns"),
 	});
 
-	// 15. kanban_list_swimlanes
+	// 16. kanban_list_swimlanes
 	pi.registerTool({
 		name: "kanban_list_swimlanes",
 		label: "Kanban List Swimlanes",

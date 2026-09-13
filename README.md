@@ -16,9 +16,15 @@ Board registry: `~/.pi/agent/kanboard.json`
   "token": "<api token>",
   "user_id": 1,
   "default": "project",
-  "boards": { "project": { "project_id": 1 } }
+  "boards": { "project": { "project_id": 1 } },
+  "users": {
+    "architect": { "username": "architect", "user_id": 3, "token": "<api token>" }
+  }
 }
 ```
+
+`users` is an optional pool of Kanboard accounts (see *Per-agent identity* below).
+The top-level `username`/`token`/`user_id` remain the default acting user.
 
 ### Active board resolution (first match wins)
 
@@ -29,11 +35,36 @@ Board registry: `~/.pi/agent/kanboard.json`
 
 An unknown board name produces an error listing the available boards.
 
+### Per-agent identity (who acts)
+
+Accounts from the `users` pool can be bound to agents. On every tool call the extension resolves *who* is acting:
+
+1. Active agent name — from the `<active_agent name="...">` tag that [pi-minimal-subagent](https://github.com/urec56/pi-minimal-subagent) injects into subagent system prompts (an `active_agent` custom session entry works too).
+2. The top-level **`user:`** key in the agent file's frontmatter, looked up in `~/.pi/agent/agents/<name>.md`, then project `.pi/agents/<name>.md` (project wins):
+
+   ```markdown
+   ---
+   name: architect
+   description: "..."
+   user: architect  # key into the registry users pool
+   ---
+   ```
+
+3. That pool entry's credentials are used for all API calls; `createComment` stamps its `user_id`.
+
+Fallbacks and errors:
+
+- No active agent (parent session) → default registry user (`username`/`token`).
+- Agent file missing, or no `user:` key → default registry user.
+- `user:` value not in the pool → hard error listing known users (fail loud, never a silent fallback).
+
+`kanban_board` reports the resolved identity as `as: <username> (user_id=<N>)`. Trust model: resolution is declarative and local — any session can declare any agent name. Intended for single-machine dev boards, not multi-tenant security.
+
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `kanban_board` | Active board (name, project_id, url) + columns + swimlanes |
+| `kanban_board` | Active board (name, project_id, url) + resolved acting user (`as`) + columns + swimlanes |
 | `kanban_list_tasks` | List tasks (open/closed) or search by `query` |
 | `kanban_get_task` | Get one task by `task_id` |
 | `kanban_create_task` | Create a task, returns `task_id` |
@@ -41,7 +72,7 @@ An unknown board name produces an error listing the available boards.
 | `kanban_move_task` | Move a task to a column/position (swimlane defaults to current; position 0/omitted = append to end, since the API rejects position 0) |
 | `kanban_close_task` | Close a task |
 | `kanban_reopen_task` | Reopen a closed task |
-| `kanban_add_comment` | Add a comment (posted as the registry user) |
+| `kanban_add_comment` | Add a comment (posted by the resolved Kanboard user — see *Per-agent identity*) |
 | `kanban_list_comments` | List comments of a task |
 | `kanban_add_subtask` | Add a subtask (`time_estimate` in seconds) |
 | `kanban_list_subtasks` | List subtasks of a task |

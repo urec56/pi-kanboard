@@ -11,6 +11,12 @@
  *   2. nearest .pi/kanboard.json walking up from cwd (to the git root, or
  *      the filesystem root when there is no git repo), format {"board":"name"}
  *   3. the registry "default" board
+ *
+ * Identity resolution (who acts):
+ *   active subagent name (<active_agent> tag / session entry) -> its agent
+ *   file's top-level `user:` frontmatter key -> credentials from the
+ *   registry "users" pool. No tag, no agent file, or no `user:` key -> the
+ *   registry default user. An unknown `user` value is a hard error.
  */
 
 import { Type } from "typebox";
@@ -25,6 +31,12 @@ import { dirname, join, resolve } from "node:path";
 // Registry
 // ---------------------------------------------------------------------------
 
+interface PoolUser {
+	username: string;
+	token: string;
+	user_id: number;
+}
+
 interface Registry {
 	url: string;
 	username: string;
@@ -32,6 +44,7 @@ interface Registry {
 	user_id: number;
 	default: string;
 	boards: Record<string, { project_id: number }>;
+	users?: Record<string, PoolUser>;
 }
 
 const REGISTRY_PATH = join(homedir(), ".pi", "agent", "kanboard.json");
@@ -128,12 +141,94 @@ function resolveBoard(cwd: string): ResolvedBoard {
 }
 
 // ---------------------------------------------------------------------------
+// Identity resolution (per-agent Kanboard user)
+// ---------------------------------------------------------------------------
+
+interface Identity {
+	username: string;
+	token: string;
+	user_id: number;
+}
+
+const ACTIVE_AGENT_TAG = /<active_agent\s+name=["']([^"']+)["'][^>]*>/i;
+
+/** Last agent name seen via before_agent_start (system-prompt tag). */
+let cachedAgentName: string | null = null;
+
+function agentFileCandidates(cwd: string, name: string): string[] {
+	// Project scopes first (nearest .pi/agents wins), then global.
+	const dirs: string[] = [];
+	let dir = resolve(cwd);
+	for (;;) {
+		dirs.push(join(dir, ".pi", "agents"));
+		if (existsSync(join(dir, ".git"))) break;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	dirs.push(join(homedir(), ".pi", "agent", "agents"));
+	return dirs.map((d) => join(d, `${name}.md`));
+}
+
+/** Read a top-level scalar frontmatter key from an agent .md file. */
+function frontmatterField(file: string, key: string): string | null {
+	let raw: string;
+	try {
+		raw = readFileSync(file, "utf8");
+	} catch {
+		return null;
+	}
+	const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(raw);
+	if (!m) return null;
+	for (const line of m[1].split(/\r?\n/)) {
+		if (/^\s/.test(line)) continue; // top-level keys only
+		const kv = new RegExp(`^${key}\\s*:\\s*(.+)$`).exec(line);
+		if (kv) return kv[1].trim().replace(/^["']|["']$/g, "");
+	}
+	return null;
+}
+
+function resolveIdentity(reg: Registry, ctx: unknown, cwd: string): Identity {
+	const fallback: Identity = { username: reg.username, token: reg.token, user_id: reg.user_id };
+
+	let name: string | null = null;
+	try {
+		const sm = (ctx as { sessionManager?: { getEntries(): Array<Record<string, unknown>> } }).sessionManager;
+		const entries = sm?.getEntries() ?? [];
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const e = entries[i];
+			if (e.type !== "custom" || e.customType !== "active_agent") continue;
+			const n = (e.data as { name?: unknown } | undefined)?.name;
+			name = typeof n === "string" && n.trim() ? n.trim() : null;
+			break; // last matching entry wins (same semantics as pi-permission-system)
+		}
+	} catch {
+		/* ctx without sessionManager */
+	}
+	if (!name) name = cachedAgentName;
+	if (!name) return fallback;
+
+	const file = agentFileCandidates(cwd, name).find((p) => existsSync(p));
+	if (!file) return fallback; // no agent file -> default user
+	const userKey = frontmatterField(file, "user");
+	if (!userKey) return fallback; // agent does not declare a Kanboard user
+
+	const u = reg.users?.[userKey];
+	if (!u) {
+		throw new Error(
+			`kanboard: agent "${name}" declares user "${userKey}", which is not in the registry users pool. Known: ${Object.keys(reg.users ?? {}).join(", ") || "(pool empty)"}`,
+		);
+	}
+	return { username: u.username, token: u.token, user_id: u.user_id };
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC client
 // ---------------------------------------------------------------------------
 
-async function rpc(reg: Registry, method: string, params: Record<string, unknown>): Promise<unknown> {
+async function rpc(reg: Registry, id: Identity, method: string, params: Record<string, unknown>): Promise<unknown> {
 	const url = reg.url.replace(/\/+$/, "") + "/jsonrpc.php";
-	const auth = Buffer.from(`${reg.username}:${reg.token}`).toString("base64");
+	const auth = Buffer.from(`${id.username}:${id.token}`).toString("base64");
 	const body = JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 });
 
 	let res: Response;
@@ -202,6 +297,15 @@ function renderersFor(name: string) {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Per-agent identity: remember who is active from the system-prompt tag so
+	// tool executions can resolve their Kanboard user even when no session
+	// entry is available. Fires per agent start; null tag -> parent session.
+	pi.on("before_agent_start", (event) => {
+		const sp = (event as { systemPrompt?: string } | undefined)?.systemPrompt ?? "";
+		const m = ACTIVE_AGENT_TAG.exec(sp);
+		cachedAgentName = m && m[1] ? m[1].trim() : null;
+	});
+
 	const boardNote =
 		"The active board and its project_id are injected automatically by the extension; you cannot target other boards. Use kanban_board to see the active board, columns and swimlanes.";
 
@@ -214,9 +318,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			const [columns, swimlanes] = await Promise.all([
-				rpc(bc.reg, "getColumns", { project_id: bc.projectId }),
-				rpc(bc.reg, "getActiveSwimlanes", { project_id: bc.projectId }),
+				rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }),
+				rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }),
 			]);
 			const cols = (columns as Array<Record<string, unknown>>).map((c) => ({ id: Number(c.id), title: String(c.title) }));
 			const lanes = (swimlanes as Array<Record<string, unknown>>).map((s) => ({ id: Number(s.id), name: String(s.name) }));
@@ -225,6 +330,7 @@ export default function (pi: ExtensionAPI) {
 				project_id: bc.projectId,
 				url: bc.reg.url,
 				source: bc.source,
+				as: `${id.username} (user_id=${id.user_id})`,
 				columns: cols,
 				swimlanes: lanes,
 			});
@@ -244,9 +350,10 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			const result = params.query
-				? await rpc(bc.reg, "searchTasks", { project_id: bc.projectId, query: params.query })
-				: await rpc(bc.reg, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 });
+				? await rpc(bc.reg, id, "searchTasks", { project_id: bc.projectId, query: params.query })
+				: await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 });
 			return toolResult(result);
 		},
 		...renderersFor("kanban_list_tasks"),
@@ -261,7 +368,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ task_id: Type.Number() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "getTask", { task_id: params.task_id }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getTask", { task_id: params.task_id }));
 		},
 		...renderersFor("kanban_get_task"),
 	});
@@ -282,7 +390,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			const taskId = await rpc(bc.reg, "createTask", {
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const taskId = await rpc(bc.reg, id, "createTask", {
 				title: params.title,
 				project_id: bc.projectId,
 				column_id: params.column_id ?? 0,
@@ -315,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			const p: Record<string, unknown> = { id: params.task_id };
 			if (params.title !== undefined) p.title = params.title;
 			if (params.description !== undefined) p.description = params.description;
@@ -322,7 +432,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.date_due !== undefined) p.date_due = params.date_due;
 			if (params.score !== undefined) p.score = params.score;
 			if (params.owner_id !== undefined) p.owner_id = params.owner_id;
-			return toolResult(await rpc(bc.reg, "updateTask", p));
+			return toolResult(await rpc(bc.reg, id, "updateTask", p));
 		},
 		...renderersFor("kanban_update_task"),
 	});
@@ -341,19 +451,20 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			const task = (await rpc(bc.reg, "getTask", { task_id: params.task_id })) as Record<string, unknown>;
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const task = (await rpc(bc.reg, id, "getTask", { task_id: params.task_id })) as Record<string, unknown>;
 			const swimlaneId = params.swimlane_id ?? Number(task.swimlane_id);
 			// Kanboard rejects position < 1 (returns false). Treat 0/omitted as "append to the end".
 			let position = params.position;
 			if (position === undefined || position < 1) {
-				const all = (await rpc(bc.reg, "getAllTasks", { project_id: bc.projectId, status_id: 1 })) as Array<Record<string, unknown>>;
+				const all = (await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: 1 })) as Array<Record<string, unknown>>;
 				const maxPos = all
 					.filter((t) => Number(t.column_id) === Number(params.column_id) && Number(t.swimlane_id) === swimlaneId)
 					.reduce((m, t) => Math.max(m, Number(t.position)), 0);
 				position = maxPos + 1;
 			}
 			return toolResult(
-				await rpc(bc.reg, "moveTaskPosition", {
+				await rpc(bc.reg, id, "moveTaskPosition", {
 					project_id: bc.projectId,
 					task_id: params.task_id,
 					column_id: params.column_id,
@@ -374,7 +485,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ task_id: Type.Number() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "closeTask", { task_id: params.task_id }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "closeTask", { task_id: params.task_id }));
 		},
 		...renderersFor("kanban_close_task"),
 	});
@@ -388,7 +500,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ task_id: Type.Number() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "openTask", { task_id: params.task_id }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "openTask", { task_id: params.task_id }));
 		},
 		...renderersFor("kanban_reopen_task"),
 	});
@@ -397,14 +510,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "kanban_add_comment",
 		label: "Kanban Add Comment",
-		description: `Add a comment to a task on the active board (posted as the registry user). Returns the comment_id. ${boardNote}`,
+		description: `Add a comment to a task on the active board, posted by the resolved Kanboard user of the current session/agent (see "as" in kanban_board; default is the registry user). Returns the comment_id. ${boardNote}`,
 		promptSnippet: "Add a comment to a Kanboard task",
 		parameters: Type.Object({ task_id: Type.Number(), content: Type.String() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			const commentId = await rpc(bc.reg, "createComment", {
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const commentId = await rpc(bc.reg, id, "createComment", {
 				task_id: params.task_id,
-				user_id: bc.reg.user_id,
+				user_id: id.user_id,
 				content: params.content,
 			});
 			return toolResult({ comment_id: commentId });
@@ -421,7 +535,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ task_id: Type.Number() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "getAllComments", { task_id: params.task_id }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getAllComments", { task_id: params.task_id }));
 		},
 		...renderersFor("kanban_list_comments"),
 	});
@@ -439,7 +554,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			const subtaskId = await rpc(bc.reg, "createSubtask", {
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const subtaskId = await rpc(bc.reg, id, "createSubtask", {
 				task_id: params.task_id,
 				title: params.title,
 				user_id: 0,
@@ -461,7 +577,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ task_id: Type.Number() }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "getAllSubtasks", { task_id: params.task_id }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getAllSubtasks", { task_id: params.task_id }));
 		},
 		...renderersFor("kanban_list_subtasks"),
 	});
@@ -480,7 +597,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			const sub = (await rpc(bc.reg, "getSubtask", { subtask_id: params.subtask_id })) as Record<string, unknown>;
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			const sub = (await rpc(bc.reg, id, "getSubtask", { subtask_id: params.subtask_id })) as Record<string, unknown>;
 			const p: Record<string, unknown> = { id: params.subtask_id, task_id: Number(sub.task_id) };
 			if (params.title !== undefined) p.title = params.title;
 			if (params.time_estimate !== undefined) p.time_estimated = params.time_estimate;
@@ -488,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 				const statusMap = { todo: 0, started: 1, done: 2 } as const;
 				p.status = statusMap[params.status];
 			}
-			return toolResult(await rpc(bc.reg, "updateSubtask", p));
+			return toolResult(await rpc(bc.reg, id, "updateSubtask", p));
 		},
 		...renderersFor("kanban_update_subtask"),
 	});
@@ -502,7 +620,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "getColumns", { project_id: bc.projectId }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }));
 		},
 		...renderersFor("kanban_list_columns"),
 	});
@@ -516,7 +635,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
-			return toolResult(await rpc(bc.reg, "getActiveSwimlanes", { project_id: bc.projectId }));
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }));
 		},
 		...renderersFor("kanban_list_swimlanes"),
 	});
@@ -545,9 +665,10 @@ export default function (pi: ExtensionAPI) {
 
 				if (arg.length === 0) {
 					const bc = resolveBoard(ctx.cwd);
+					const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 					const [columns, swimlanes] = await Promise.all([
-						rpc(bc.reg, "getColumns", { project_id: bc.projectId }),
-						rpc(bc.reg, "getActiveSwimlanes", { project_id: bc.projectId }),
+						rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }),
+						rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }),
 					]);
 					const cols = (columns as Array<Record<string, unknown>>).map((c) => `${c.id}:${c.title}`).join(", ");
 					const lanes = (swimlanes as Array<Record<string, unknown>>).map((s) => `${s.id}:${s.name}`).join(", ");

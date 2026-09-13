@@ -396,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "kanban_create_task",
 		label: "Kanban Create Task",
-		description: `Create a task on the active board. Returns the new task_id. ${boardNote}`,
+		description: `Create a task on the active board, optionally assigning an owner (owner_id). Returns the new task_id. ${boardNote}`,
 		promptSnippet: "Create a Kanboard task on the active board",
 		parameters: Type.Object({
 			title: Type.String(),
@@ -405,6 +405,7 @@ export default function (pi: ExtensionAPI) {
 			swimlane_id: Type.Optional(Type.Number()),
 			priority: Type.Optional(Type.Number()),
 			date_due: Type.Optional(Type.String()),
+			owner_id: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
@@ -417,7 +418,7 @@ export default function (pi: ExtensionAPI) {
 				swimlane_id: params.swimlane_id ?? null,
 				priority: params.priority ?? 0,
 				date_due: params.date_due ?? "",
-				owner_id: 0,
+				owner_id: params.owner_id ?? 0,
 				score: 0,
 			});
 			return toolResult({ task_id: taskId });

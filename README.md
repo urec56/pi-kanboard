@@ -68,7 +68,7 @@ Fallbacks and errors:
 | `kanban_list_tasks` | List tasks (open/closed) or search by `query` |
 | `kanban_my_tasks` | List tasks assigned to the resolved Kanboard user of the current session/agent (open by default) |
 | `kanban_get_task` | Get one task by `task_id` |
-| `kanban_create_task` | Create a task, returns `task_id` |
+| `kanban_create_task` | Create a task (optional `owner_id`, column, priority, due date), returns `task_id` |
 | `kanban_update_task` | Update task fields (only provided ones) |
 | `kanban_move_task` | Move a task to a column/position (swimlane defaults to current; position 0/omitted = append to end, since the API rejects position 0) |
 | `kanban_close_task` | Close a task |

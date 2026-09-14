@@ -152,8 +152,11 @@ interface Identity {
 
 const ACTIVE_AGENT_TAG = /<active_agent\s+name=["']([^"']+)["'][^>]*>/i;
 
-/** Last agent name seen via before_agent_start (system-prompt tag). */
-let cachedAgentName: string | null = null;
+/** Extract the active-agent name from a system prompt carrying the <active_agent> tag. */
+function agentNameFromPrompt(sp: unknown): string | null {
+	const m = ACTIVE_AGENT_TAG.exec(typeof sp === "string" ? sp : "");
+	return m && m[1] ? m[1].trim() : null;
+}
 
 function agentFileCandidates(cwd: string, name: string): string[] {
 	// Project scopes first (nearest .pi/agents wins), then global.
@@ -205,7 +208,15 @@ function resolveIdentity(reg: Registry, ctx: unknown, cwd: string): Identity {
 	} catch {
 		/* ctx without sessionManager */
 	}
-	if (!name) name = cachedAgentName;
+	// Live system prompt (final, after all before_agent_start mutations) —
+	// independent of extension load order and mid-session agent switches.
+	if (!name) {
+		try {
+			name = agentNameFromPrompt((ctx as { getSystemPrompt?: () => unknown }).getSystemPrompt?.());
+		} catch {
+			/* ctx without getSystemPrompt (older pi versions) */
+		}
+	}
 	if (!name) return fallback;
 
 	const file = agentFileCandidates(cwd, name).find((p) => existsSync(p));
@@ -297,14 +308,9 @@ function renderersFor(name: string) {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	// Per-agent identity: remember who is active from the system-prompt tag so
-	// tool executions can resolve their Kanboard user even when no session
-	// entry is available. Fires per agent start; null tag -> parent session.
-	pi.on("before_agent_start", (event) => {
-		const sp = (event as { systemPrompt?: string } | undefined)?.systemPrompt ?? "";
-		const m = ACTIVE_AGENT_TAG.exec(sp);
-		cachedAgentName = m && m[1] ? m[1].trim() : null;
-	});
+	// Per-agent identity is resolved lazily at tool-execution time from the
+	// live system prompt (ctx.getSystemPrompt()), so it does not depend on
+	// extension load order or on caching during before_agent_start.
 
 	const boardNote =
 		"The active board and its project_id are injected automatically by the extension; you cannot target other boards. Use kanban_board to see the active board, columns and swimlanes.";

@@ -21,6 +21,7 @@
 
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -304,6 +305,149 @@ function renderersFor(name: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Rendering: a collapsed row shows a compact summary; expanded (ctrl+o) shows
+// the full text — same pattern as built-in read/write tools. The model always
+// receives the full content; this only affects what the user sees in the TUI.
+// ---------------------------------------------------------------------------
+
+function formatCommentLine(c: Record<string, unknown>): string {
+	const id = c.id !== undefined ? String(c.id) : "?";
+	const author = typeof c.username === "string" && c.username ? c.username : `user ${c.user_id ?? "?"}`;
+	let date = "";
+	if (typeof c.date_creation === "number") {
+		const d = new Date(c.date_creation * 1000);
+		const p = (n: number) => String(n).padStart(2, "0");
+		date = ` ${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+	}
+	const raw = typeof c.comment === "string" ? c.comment.replace(/\s+/g, " ").trim() : "";
+	const text = raw.length > 60 ? `${raw.slice(0, 60).trimEnd()}…` : raw || "(empty)";
+	return `#${id} ${author}${date}: ${text}`;
+}
+
+type RenderResult = { content?: Array<{ type: string; text?: string }>; details?: { result?: unknown } };
+
+type Summarizer = (raw: unknown) => string[] | null;
+
+function resultText(result: RenderResult): string {
+	return (result.content ?? [])
+		.map((c) => (c.type === "text" ? c.text ?? "" : ""))
+		.join("");
+}
+
+/** Flatten to a single line and truncate with an ellipsis. */
+function oneLine(v: unknown, limit: number): string | null {
+	if (typeof v !== "string") return null;
+	const s = v.replace(/\s+/g, " ").trim();
+	return s.length > limit ? `${s.slice(0, limit).trimEnd()}…` : s || null;
+}
+
+function taskLine(t: Record<string, unknown>): string {
+	const col = t.column_id != null && Number(t.column_id) > 0 ? ` [col ${t.column_id}]` : "";
+	return `#${t.id ?? "?"}${col} ${oneLine(t.title ?? "", 50) ?? "(untitled)"}`;
+}
+
+function summarizeTaskList(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return ["(no tasks)"];
+	return [`${raw.length} task${raw.length === 1 ? "" : "s"}`, ...(raw as Array<Record<string, unknown>>).map(taskLine)];
+}
+
+function summarizeTask(raw: unknown): string[] | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const t = raw as Record<string, unknown>;
+	if (t.id === undefined) return null; // not a task object — show full text instead
+	const lines = [taskLine(t)];
+	const desc = oneLine(String(t.description ?? ""), 80);
+	if (desc) lines.push(`desc: ${desc}`);
+	return lines;
+}
+
+function subtaskLine(s: Record<string, unknown>): string {
+	const status = typeof s.status_name === "string" && s.status_name ? s.status_name : ["todo", "started", "done"][Number(s.status)] ?? "?";
+	return `#${s.id ?? "?"} ${status}: ${oneLine(s.title ?? "", 50) ?? "(untitled)"}`;
+}
+
+function summarizeSubtaskList(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return ["(no subtasks)"];
+	return [`${raw.length} subtask${raw.length === 1 ? "" : "s"}`, ...(raw as Array<Record<string, unknown>>).map(subtaskLine)];
+}
+
+function summarizeSubtask(raw: unknown): string[] | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const s = raw as Record<string, unknown>;
+	if (s.id === undefined) return null;
+	return [subtaskLine(s)];
+}
+
+function summarizeColumns(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return ["(no columns)"];
+	return (raw as Array<Record<string, unknown>>).map((c) => `#${c.id ?? "?"} ${oneLine(c.title ?? c.name ?? "", 40) ?? ""}`.trim());
+}
+
+function summarizeSwimlanes(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return ["(no swimlanes)"];
+	return (raw as Array<Record<string, unknown>>).map((s) => `#${s.id ?? "?"} ${oneLine(s.name ?? "", 40) ?? ""}`.trim());
+}
+
+function summarizeBoard(raw: unknown): string[] | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const b = raw as Record<string, unknown>;
+	if (typeof b.board !== "string") return null; // not our board summary — show full text instead
+	const fmt = (items: Array<Record<string, unknown>>, field: string) =>
+		items.map((i) => `${i.id ?? "?"}:${oneLine(i[field] ?? "", 20) ?? "?"}`).join(", ");
+	return [
+		`${b.board} (project ${b.project_id}) via ${b.source}`,
+		`as ${typeof b.as === "string" ? b.as : "?"}`,
+		Array.isArray(b.columns) ? `columns: ${fmt(b.columns as Array<Record<string, unknown>>, "title")}` : "columns: ?",
+		Array.isArray(b.swimlanes) ? `swimlanes: ${fmt(b.swimlanes as Array<Record<string, unknown>>, "name")}` : "swimlanes: ?",
+	];
+}
+
+function summarizeMove(raw: unknown): string[] | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const o = raw as Record<string, unknown>;
+	if (o.task_id === undefined) return null; // unexpected shape — show full text instead
+	return [`task #${o.task_id} → col ${o.column_id ?? "?"}${o.position != null ? ` pos ${o.position}` : ""}`];
+}
+
+function summarizeIdResult(key: string, verb: string): Summarizer {
+	return (raw) => {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+		const o = raw as Record<string, unknown>;
+		if (o[key] === undefined) return null;
+		return [`${key.replace(/_id$/, "")} #${o[key]} ${verb}`];
+	};
+}
+
+function summarizeComments(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return ["(no comments)"];
+	return [`${raw.length} comment${raw.length === 1 ? "" : "s"}`, ...(raw as Array<Record<string, unknown>>).map(formatCommentLine)];
+}
+
+/** Collapsed: compact summary + expand hint; expanded (or unrecognized shape): full text. */
+function smartRender(result: RenderResult, opts: { expanded?: boolean }, theme: Theme, summarize: Summarizer): Text {
+	if (!opts?.expanded) {
+		const lines = summarize(result.details?.result);
+		if (lines !== null) {
+			const noHint = lines.length === 1 && lines[0].startsWith("(no ");
+			return new Text(`${theme.fg("muted", lines.join("\n"))}${noHint ? "" : `\n${keyHint("app.tools.expand", "to expand")}`}`, 0, 0);
+		}
+	}
+	const full = resultText(result);
+	return new Text(theme.fg("muted", full || "(no output)"), 0, 0);
+}
+
+function toolRenderers(name: string, summarize?: Summarizer) {
+	const base = renderersFor(name);
+	if (!summarize) return base;
+	return { ...base, renderResult: (result: RenderResult, opts: { expanded?: boolean }, theme: Theme) => smartRender(result, opts, theme, summarize) };
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -341,7 +485,7 @@ export default function (pi: ExtensionAPI) {
 				swimlanes: lanes,
 			});
 		},
-		...renderersFor("kanban_board"),
+		...toolRenderers("kanban_board", summarizeBoard),
 	});
 
 	// 2. kanban_list_tasks
@@ -362,7 +506,7 @@ export default function (pi: ExtensionAPI) {
 				: await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 });
 			return toolResult(result);
 		},
-		...renderersFor("kanban_list_tasks"),
+		...toolRenderers("kanban_list_tasks", summarizeTaskList),
 	});
 
 	// 3. kanban_my_tasks
@@ -380,7 +524,7 @@ export default function (pi: ExtensionAPI) {
 			const all = (await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 })) as Array<Record<string, unknown>>;
 			return toolResult(all.filter((t) => Number(t.owner_id) === id.user_id));
 		},
-		...renderersFor("kanban_my_tasks"),
+		...toolRenderers("kanban_my_tasks", summarizeTaskList),
 	});
 
 	// 4. kanban_get_task
@@ -395,7 +539,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "getTask", { task_id: params.task_id }));
 		},
-		...renderersFor("kanban_get_task"),
+		...toolRenderers("kanban_get_task", summarizeTask),
 	});
 
 	// 5. kanban_create_task
@@ -429,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return toolResult({ task_id: taskId });
 		},
-		...renderersFor("kanban_create_task"),
+		...toolRenderers("kanban_create_task", summarizeIdResult("task_id", "created")),
 	});
 
 	// 6. kanban_update_task
@@ -459,7 +603,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.owner_id !== undefined) p.owner_id = params.owner_id;
 			return toolResult(await rpc(bc.reg, id, "updateTask", p));
 		},
-		...renderersFor("kanban_update_task"),
+		...toolRenderers("kanban_update_task", summarizeTask),
 	});
 
 	// 7. kanban_move_task
@@ -498,7 +642,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			);
 		},
-		...renderersFor("kanban_move_task"),
+		...toolRenderers("kanban_move_task", summarizeMove),
 	});
 
 	// 8. kanban_close_task
@@ -513,7 +657,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "closeTask", { task_id: params.task_id }));
 		},
-		...renderersFor("kanban_close_task"),
+		...toolRenderers("kanban_close_task", summarizeTask),
 	});
 
 	// 9. kanban_reopen_task
@@ -528,7 +672,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "openTask", { task_id: params.task_id }));
 		},
-		...renderersFor("kanban_reopen_task"),
+		...toolRenderers("kanban_reopen_task", summarizeTask),
 	});
 
 	// 10. kanban_add_comment
@@ -548,7 +692,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return toolResult({ comment_id: commentId });
 		},
-		...renderersFor("kanban_add_comment"),
+		...toolRenderers("kanban_add_comment", summarizeIdResult("comment_id", "added")),
 	});
 
 	// 11. kanban_list_comments
@@ -563,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "getAllComments", { task_id: params.task_id }));
 		},
-		...renderersFor("kanban_list_comments"),
+		...toolRenderers("kanban_list_comments", summarizeComments),
 	});
 
 	// 12. kanban_add_subtask
@@ -590,7 +734,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return toolResult({ subtask_id: subtaskId });
 		},
-		...renderersFor("kanban_add_subtask"),
+		...toolRenderers("kanban_add_subtask", summarizeIdResult("subtask_id", "added")),
 	});
 
 	// 13. kanban_list_subtasks
@@ -605,7 +749,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "getAllSubtasks", { task_id: params.task_id }));
 		},
-		...renderersFor("kanban_list_subtasks"),
+		...toolRenderers("kanban_list_subtasks", summarizeSubtaskList),
 	});
 
 	// 14. kanban_update_subtask
@@ -633,7 +777,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return toolResult(await rpc(bc.reg, id, "updateSubtask", p));
 		},
-		...renderersFor("kanban_update_subtask"),
+		...toolRenderers("kanban_update_subtask", summarizeSubtask),
 	});
 
 	// 15. kanban_list_columns
@@ -648,7 +792,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }));
 		},
-		...renderersFor("kanban_list_columns"),
+		...toolRenderers("kanban_list_columns", summarizeColumns),
 	});
 
 	// 16. kanban_list_swimlanes
@@ -663,7 +807,7 @@ export default function (pi: ExtensionAPI) {
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			return toolResult(await rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }));
 		},
-		...renderersFor("kanban_list_swimlanes"),
+		...toolRenderers("kanban_list_swimlanes", summarizeSwimlanes),
 	});
 
 	// /board command

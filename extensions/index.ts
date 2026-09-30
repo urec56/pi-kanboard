@@ -857,11 +857,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				// No git repo above cwd -> target the session's cwd itself so the
+				// file stays next to where the session runs; findBoardFile() picks it up.
 				const root = findProjectRoot(ctx.cwd);
-				const piDir = join(root, ".pi");
-				mkdirSync(piDir, { recursive: true });
-				const file = join(piDir, "kanboard.json");
-				writeFileSync(file, JSON.stringify({ board: arg }, null, 2) + "\n");
+				const target = existsSync(join(root, ".git")) ? root : resolve(ctx.cwd);
+				const piDir = join(target, ".pi");
+				let file: string;
+				try {
+					mkdirSync(piDir, { recursive: true });
+					file = join(piDir, "kanboard.json");
+					writeFileSync(file, JSON.stringify({ board: arg }, null, 2) + "\n");
+				} catch (e) {
+					show(`Cannot write ${join(target, ".pi", "kanboard.json")}: ${(e as Error).message}. Create the file manually or use KANBOARD_BOARD.`, "error");
+					return;
+				}
 				show(`Active board set to "${arg}" (written to ${file})`);
 			} catch (e) {
 				show((e as Error).message, "error");

@@ -88,7 +88,9 @@ There is intentionally **no** delete/remove tool.
 - `/board` — show the resolved active board (like `kanban_board`).
 - `/board <name>` — validate the name against the registry and write
   `{"board":"<name>"}` to `.pi/kanboard.json` at the project root (the nearest
-  git root, or the filesystem root), creating `.pi/` if needed.
+  git root; the session's cwd when there is no git repo), creating `.pi/`
+  if needed. If the file cannot be written, it suggests creating it manually
+  or using `KANBOARD_BOARD`.
 
 ## Install
 

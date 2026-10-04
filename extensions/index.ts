@@ -238,7 +238,7 @@ function resolveIdentity(reg: Registry, ctx: unknown, cwd: string): Identity {
 // JSON-RPC client
 // ---------------------------------------------------------------------------
 
-async function rpc(reg: Registry, id: Identity, method: string, params: Record<string, unknown>): Promise<unknown> {
+async function rpcCall(reg: Registry, id: Identity, method: string, params: Record<string, unknown>): Promise<unknown> {
 	const url = reg.url.replace(/\/+$/, "") + "/jsonrpc.php";
 	const auth = Buffer.from(`${id.username}:${id.token}`).toString("base64");
 	const body = JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 });
@@ -272,6 +272,36 @@ async function rpc(reg: Registry, id: Identity, method: string, params: Record<s
 		throw new Error(`Kanboard error: ${err.message ?? "unknown error"}${extra}`);
 	}
 	return data.result;
+}
+
+// ---------------------------------------------------------------------------
+// Retry wrapper
+//
+// Kanboard on SQLite fails concurrent writes with "database is locked"
+// (SQLITE_BUSY) — e.g. when several kanban_move_task calls run in parallel.
+// The failed write is rolled back server-side (nothing was applied), so
+// retrying is safe. A few attempts with backoff absorb the contention.
+// ---------------------------------------------------------------------------
+
+const SQLITE_BUSY_RE = /database is locked|SQLITE_BUSY|General error: 5/i;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function rpc(
+	reg: Registry,
+	id: Identity,
+	method: string,
+	params: Record<string, unknown>,
+	attempts = 5,
+): Promise<unknown> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await rpcCall(reg, id, method, params);
+		} catch (e) {
+			if (!SQLITE_BUSY_RE.test((e as Error).message ?? "") || attempt >= attempts) throw e;
+			await sleep(Math.min(200 * 2 ** (attempt - 1), 2000) + Math.floor(Math.random() * 100));
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

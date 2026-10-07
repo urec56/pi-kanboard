@@ -75,6 +75,7 @@ Fallbacks and errors:
 | `kanban_reopen_task` | Reopen a closed task |
 | `kanban_add_comment` | Add a comment (posted by the resolved Kanboard user — see *Per-agent identity*) |
 | `kanban_list_comments` | List comments of a task |
+| `kanban_get_comment` | Get one comment by `comment_id` |
 | `kanban_add_subtask` | Add a subtask (`time_estimate` in seconds) |
 | `kanban_list_subtasks` | List subtasks of a task |
 | `kanban_update_subtask` | Update a subtask (`status`: todo/started/done) |

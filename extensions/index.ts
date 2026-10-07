@@ -458,6 +458,13 @@ function summarizeComments(raw: unknown): string[] | null {
 	return [`${raw.length} comment${raw.length === 1 ? "" : "s"}`, ...(raw as Array<Record<string, unknown>>).map(formatCommentLine)];
 }
 
+function summarizeComment(raw: unknown): string[] | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const c = raw as Record<string, unknown>;
+	if (c.id === undefined) return null;
+	return [formatCommentLine(c)];
+}
+
 /** Collapsed: compact summary + expand hint; expanded (or unrecognized shape): full text. */
 function smartRender(result: RenderResult, opts: { expanded?: boolean }, theme: Theme, summarize: Summarizer): Text {
 	if (!opts?.expanded) {
@@ -740,7 +747,22 @@ export default function (pi: ExtensionAPI) {
 		...toolRenderers("kanban_list_comments", summarizeComments),
 	});
 
-	// 12. kanban_add_subtask
+	// 12. kanban_get_comment
+	pi.registerTool({
+		name: "kanban_get_comment",
+		label: "Kanban Get Comment",
+		description: `Get one comment by id from a task on the active board. ${boardNote}`,
+		promptSnippet: "Get a single Kanboard comment by id",
+		parameters: Type.Object({ comment_id: Type.Number() }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const bc = resolveBoard(ctx.cwd);
+			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
+			return toolResult(await rpc(bc.reg, id, "getComment", { comment_id: params.comment_id }));
+		},
+		...toolRenderers("kanban_get_comment", summarizeComment),
+	});
+
+	// 13. kanban_add_subtask
 	pi.registerTool({
 		name: "kanban_add_subtask",
 		label: "Kanban Add Subtask",
@@ -767,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 		...toolRenderers("kanban_add_subtask", summarizeIdResult("subtask_id", "added")),
 	});
 
-	// 13. kanban_list_subtasks
+	// 14. kanban_list_subtasks
 	pi.registerTool({
 		name: "kanban_list_subtasks",
 		label: "Kanban List Subtasks",
@@ -782,7 +804,7 @@ export default function (pi: ExtensionAPI) {
 		...toolRenderers("kanban_list_subtasks", summarizeSubtaskList),
 	});
 
-	// 14. kanban_update_subtask
+	// 15. kanban_update_subtask
 	pi.registerTool({
 		name: "kanban_update_subtask",
 		label: "Kanban Update Subtask",
@@ -810,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 		...toolRenderers("kanban_update_subtask", summarizeSubtask),
 	});
 
-	// 15. kanban_list_columns
+	// 16. kanban_list_columns
 	pi.registerTool({
 		name: "kanban_list_columns",
 		label: "Kanban List Columns",
@@ -825,7 +847,7 @@ export default function (pi: ExtensionAPI) {
 		...toolRenderers("kanban_list_columns", summarizeColumns),
 	});
 
-	// 16. kanban_list_swimlanes
+	// 17. kanban_list_swimlanes
 	pi.registerTool({
 		name: "kanban_list_swimlanes",
 		label: "Kanban List Swimlanes",

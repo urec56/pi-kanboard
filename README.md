@@ -84,6 +84,13 @@ Fallbacks and errors:
 
 There is intentionally **no** delete/remove tool.
 
+### Output format
+
+Tool results are returned to the model as **compact plain text, never raw JSON**
+(e.g. one line per task: `#3 [col 2] Fix login bug (Open, owner 2, due 2025-01-15)`).
+In the TUI a result shows a collapsed one-line summary; `ctrl+o` expands it to the
+full text. Unexpected API shapes fall back to an indented plain-text dump.
+
 ## Command
 
 - `/board` — show the resolved active board (like `kanban_board`).

@@ -268,7 +268,7 @@ async function rpcCall(reg: Registry, id: Identity, method: string, params: Reco
 
 	if (data.error) {
 		const err = data.error;
-		const extra = err.data !== undefined ? ` (${typeof err.data === "string" ? err.data : JSON.stringify(err.data)})` : "";
+		const extra = err.data !== undefined ? ` (${typeof err.data === "string" ? err.data : dumpText(err.data)})` : "";
 		throw new Error(`Kanboard error: ${err.message ?? "unknown error"}${extra}`);
 	}
 	return data.result;
@@ -308,20 +308,24 @@ async function rpc(
 // Result helpers
 // ---------------------------------------------------------------------------
 
-function toolResult(result: unknown, details?: unknown) {
-	const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+/**
+ * Build a tool result: `text` is what the model receives (compact plain text,
+ * not raw JSON); `raw` is the underlying payload kept in `details` for the TUI
+ * renderers (collapsed summary / expanded view).
+ */
+function toolResult(text: string, raw?: unknown) {
 	return {
 		content: [{ type: "text" as const, text }],
-		details: details ?? { result },
+		details: { result: raw },
 	};
 }
 
 function renderersFor(name: string) {
 	return {
-		renderCall(args: Record<string, unknown>, theme: Theme) {
+		renderCall(args: object, theme: Theme) {
 			const parts = Object.entries(args)
 				.filter(([, v]) => v !== undefined)
-				.map(([k, v]) => (typeof v === "string" ? `${k}=${JSON.stringify(v)}` : `${k}=${v}`));
+				.map(([k, v]) => `${k}=${v}`);
 			const suffix = parts.length > 0 ? " " + theme.fg("muted", parts.join(" ")) : "";
 			return new Text(theme.fg("toolTitle", theme.bold(name)) + suffix, 0, 0);
 		},
@@ -465,6 +469,196 @@ function summarizeComment(raw: unknown): string[] | null {
 	return [formatCommentLine(c)];
 }
 
+// ---------------------------------------------------------------------------
+// Model-facing formatters
+//
+// Tool results are returned to the model as compact plain text, not raw JSON:
+// fewer tokens, easier to parse. The raw payload stays in `details` for the
+// TUI renderers; unexpected shapes fall back to a plain-text dump.
+// ---------------------------------------------------------------------------
+
+/** Format a Kanboard timestamp (unix seconds) or date string for display. */
+function fmtDate(v: unknown): string | null {
+	if (typeof v === "number" && v > 0) {
+		const d = new Date(v * 1000);
+		const p = (n: number) => String(n).padStart(2, "0");
+		return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+	}
+	if (typeof v === "string" && v.trim()) return v.trim();
+	return null;
+}
+
+function taskStatus(t: Record<string, unknown>): string {
+	if (typeof t.status_name === "string" && t.status_name) return t.status_name;
+	return Number(t.status_id) === 0 ? "closed" : "open";
+}
+
+/** One compact line per task: #id [col N] title (status, owner, prio, score, due). */
+function taskLineFull(t: Record<string, unknown>): string {
+	const col = t.column_id != null && Number(t.column_id) > 0 ? ` [col ${t.column_id}]` : "";
+	const bits: string[] = [taskStatus(t)];
+	if (t.owner_id) bits.push(`owner ${t.owner_id}`);
+	if (t.priority) bits.push(`prio ${t.priority}`);
+	if (t.score) bits.push(`score ${t.score}`);
+	const due = fmtDate(t.date_due);
+	if (due) bits.push(`due ${due}`);
+	return `#${t.id ?? "?"}${col} ${oneLine(t.title ?? "", 60) ?? "(untitled)"} (${bits.join(", ")})`;
+}
+
+function formatTaskList(raw: unknown): string | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return "(no tasks)";
+	const lines = (raw as Array<Record<string, unknown>>).map(taskLineFull);
+	return `${raw.length} task${raw.length === 1 ? "" : "s"}:\n${lines.join("\n")}`;
+}
+
+/** Full single-task block: header, key fields, description. */
+function formatTask(raw: unknown): string | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const t = raw as Record<string, unknown>;
+	if (t.id === undefined) return null;
+	const lines = [`#${t.id} ${oneLine(t.title ?? "", 80) ?? "(untitled)"}`, `status: ${taskStatus(t)}`];
+	const add = (label: string, v: unknown) => {
+		if (v !== undefined && v !== null && v !== "") lines.push(`${label}: ${v}`);
+	};
+	add("column", t.column_id);
+	add("swimlane", t.swimlane_id);
+	add("owner", t.owner_id);
+	add("priority", t.priority);
+	add("score", t.score);
+	add("due", fmtDate(t.date_due));
+	add("start", fmtDate(t.date_start));
+	add("created", fmtDate(t.date_creation));
+	add("last change", fmtDate(t.date_of_last_change));
+	const labels = Array.isArray(t.labels)
+		? (t.labels as Array<Record<string, unknown>>).map((l) => (typeof l.name === "string" ? l.name : "")).filter(Boolean)
+		: [];
+	if (labels.length > 0) lines.push(`labels: ${labels.join(", ")}`);
+	const desc = typeof t.description === "string" ? t.description.trim() : "";
+	if (desc) lines.push(`description:\n${desc}`);
+	return lines.join("\n");
+}
+
+function formatColumns(raw: unknown): string | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return "(no columns)";
+	const lines = (raw as Array<Record<string, unknown>>).map((c) => `#${c.id ?? "?"} ${oneLine(c.title ?? c.name ?? "", 60) ?? ""}`.trim());
+	return `${raw.length} column${raw.length === 1 ? "" : "s"}:\n${lines.join("\n")}`;
+}
+
+function formatSwimlanes(raw: unknown): string | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return "(no swimlanes)";
+	const lines = (raw as Array<Record<string, unknown>>).map((s) => `#${s.id ?? "?"} ${oneLine(s.name ?? "", 60) ?? ""}`.trim());
+	return `${raw.length} swimlane${raw.length === 1 ? "" : "s"}:\n${lines.join("\n")}`;
+}
+
+/** One comment block: header line + full comment text (no truncation). */
+function commentBlock(c: Record<string, unknown>): string {
+	const id = c.id !== undefined ? String(c.id) : "?";
+	const author = typeof c.username === "string" && c.username ? c.username : `user ${c.user_id ?? "?"}`;
+	const date = fmtDate(c.date_creation);
+	const text = typeof c.comment === "string" ? c.comment : "";
+	return `#${id} ${author}${date ? ` ${date}` : ""}:\n${text || "(empty)"}`;
+}
+
+function formatComments(raw: unknown): string | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return "(no comments)";
+	const blocks = (raw as Array<Record<string, unknown>>).map(commentBlock);
+	return `${raw.length} comment${raw.length === 1 ? "" : "s"}:\n${blocks.join("\n")}`;
+}
+
+function formatComment(raw: unknown): string | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const c = raw as Record<string, unknown>;
+	if (c.id === undefined) return null;
+	return commentBlock(c);
+}
+
+function subtaskLineFull(s: Record<string, unknown>): string {
+	const status = typeof s.status_name === "string" && s.status_name ? s.status_name : ["todo", "started", "done"][Number(s.status)] ?? "?";
+	const bits: string[] = [];
+	if (s.time_estimated) bits.push(`est ${s.time_estimated}s`);
+	if (s.time_spent) bits.push(`spent ${s.time_spent}s`);
+	const suffix = bits.length > 0 ? ` (${bits.join(", ")})` : "";
+	return `#${s.id ?? "?"} ${status}: ${oneLine(s.title ?? "", 60) ?? "(untitled)"}${suffix}`;
+}
+
+function formatSubtaskList(raw: unknown): string | null {
+	if (!Array.isArray(raw)) return null;
+	if (raw.length === 0) return "(no subtasks)";
+	const lines = (raw as Array<Record<string, unknown>>).map(subtaskLineFull);
+	return `${raw.length} subtask${raw.length === 1 ? "" : "s"}:\n${lines.join("\n")}`;
+}
+
+function formatSubtask(raw: unknown): string | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const s = raw as Record<string, unknown>;
+	if (s.id === undefined) return null;
+	return subtaskLineFull(s);
+}
+
+interface BoardInfo {
+	board: string;
+	project_id: number;
+	url: string;
+	source: string;
+	as: string;
+	columns: Array<{ id: number; title: string }>;
+	swimlanes: Array<{ id: number; name: string }>;
+}
+
+function formatBoard(b: BoardInfo): string {
+	const cols = b.columns.map((c) => `#${c.id} ${c.title}`).join(", ");
+	const lanes = b.swimlanes.map((s) => `#${s.id} ${s.name}`).join(", ");
+	return [
+		`Board: ${b.board} (project ${b.project_id}, ${b.url})`,
+		`source: ${b.source}`,
+		`as: ${b.as}`,
+		`columns: ${cols || "(none)"}`,
+		`swimlanes: ${lanes || "(none)"}`,
+	].join("\n");
+}
+
+/**
+ * Render an arbitrary value as compact plain text (never raw JSON). Fallback
+ * for result shapes the dedicated formatters don't cover.
+ */
+function dumpText(v: unknown, depth = 0): string {
+	const pad = "  ".repeat(depth);
+	if (v === null) return "null";
+	if (v === undefined) return "";
+	if (Array.isArray(v)) {
+		if (v.length === 0) return "(empty)";
+		const childPad = "  ".repeat(depth + 1);
+		return v
+			.map((item) => {
+				const s = dumpText(item, depth + 1);
+				const lines = s.split("\n");
+				const first = lines[0].startsWith(childPad) ? lines[0].slice(childPad.length) : lines[0];
+				return lines.length > 1 ? `${pad}- ${first}\n${lines.slice(1).join("\n")}` : `${pad}- ${first}`;
+			})
+			.join("\n");
+	}
+	if (typeof v === "object") {
+		const entries = Object.entries(v as Record<string, unknown>).filter(([, val]) => val !== undefined);
+		if (entries.length === 0) return "(empty)";
+		return entries
+			.map(([k, val]) => {
+				const s = dumpText(val, depth + 1);
+				return s.includes("\n") ? `${pad}${k}:\n${s}` : `${pad}${k}: ${s}`;
+			})
+			.join("\n");
+	}
+	return String(v);
+}
+
+/** Format a raw payload for the model; plain-text dump as fallback for unexpected shapes. */
+function formatResult(raw: unknown, format: (raw: unknown) => string | null): string {
+	return format(raw) ?? dumpText(raw);
+}
+
 /** Collapsed: compact summary + expand hint; expanded (or unrecognized shape): full text. */
 function smartRender(result: RenderResult, opts: { expanded?: boolean }, theme: Theme, summarize: Summarizer): Text {
 	if (!opts?.expanded) {
@@ -510,17 +704,16 @@ export default function (pi: ExtensionAPI) {
 				rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }),
 				rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }),
 			]);
-			const cols = (columns as Array<Record<string, unknown>>).map((c) => ({ id: Number(c.id), title: String(c.title) }));
-			const lanes = (swimlanes as Array<Record<string, unknown>>).map((s) => ({ id: Number(s.id), name: String(s.name) }));
-			return toolResult({
+			const board: BoardInfo = {
 				board: bc.name,
 				project_id: bc.projectId,
 				url: bc.reg.url,
 				source: bc.source,
 				as: `${id.username} (user_id=${id.user_id})`,
-				columns: cols,
-				swimlanes: lanes,
-			});
+				columns: (columns as Array<Record<string, unknown>>).map((c) => ({ id: Number(c.id), title: String(c.title) })),
+				swimlanes: (swimlanes as Array<Record<string, unknown>>).map((s) => ({ id: Number(s.id), name: String(s.name) })),
+			};
+			return toolResult(formatBoard(board), board);
 		},
 		...toolRenderers("kanban_board", summarizeBoard),
 	});
@@ -541,7 +734,7 @@ export default function (pi: ExtensionAPI) {
 			const result = params.query
 				? await rpc(bc.reg, id, "searchTasks", { project_id: bc.projectId, query: params.query })
 				: await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 });
-			return toolResult(result);
+			return toolResult(formatResult(result, formatTaskList), result);
 		},
 		...toolRenderers("kanban_list_tasks", summarizeTaskList),
 	});
@@ -559,7 +752,8 @@ export default function (pi: ExtensionAPI) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
 			const all = (await rpc(bc.reg, id, "getAllTasks", { project_id: bc.projectId, status_id: params.status === "closed" ? 0 : 1 })) as Array<Record<string, unknown>>;
-			return toolResult(all.filter((t) => Number(t.owner_id) === id.user_id));
+			const mine = all.filter((t) => Number(t.owner_id) === id.user_id);
+			return toolResult(formatResult(mine, formatTaskList), mine);
 		},
 		...toolRenderers("kanban_my_tasks", summarizeTaskList),
 	});
@@ -574,7 +768,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getTask", { task_id: params.task_id }));
+			const task = await rpc(bc.reg, id, "getTask", { task_id: params.task_id });
+			return toolResult(formatResult(task, formatTask), task);
 		},
 		...toolRenderers("kanban_get_task", summarizeTask),
 	});
@@ -608,7 +803,7 @@ export default function (pi: ExtensionAPI) {
 				owner_id: params.owner_id ?? 0,
 				score: 0,
 			});
-			return toolResult({ task_id: taskId });
+			return toolResult(`task #${taskId} created`, { task_id: taskId });
 		},
 		...toolRenderers("kanban_create_task", summarizeIdResult("task_id", "created")),
 	});
@@ -638,7 +833,8 @@ export default function (pi: ExtensionAPI) {
 			if (params.date_due !== undefined) p.date_due = params.date_due;
 			if (params.score !== undefined) p.score = params.score;
 			if (params.owner_id !== undefined) p.owner_id = params.owner_id;
-			return toolResult(await rpc(bc.reg, id, "updateTask", p));
+			const task = await rpc(bc.reg, id, "updateTask", p);
+			return toolResult(formatResult(task, formatTask), task);
 		},
 		...toolRenderers("kanban_update_task", summarizeTask),
 	});
@@ -669,15 +865,19 @@ export default function (pi: ExtensionAPI) {
 					.reduce((m, t) => Math.max(m, Number(t.position)), 0);
 				position = maxPos + 1;
 			}
-			return toolResult(
-				await rpc(bc.reg, id, "moveTaskPosition", {
-					project_id: bc.projectId,
-					task_id: params.task_id,
-					column_id: params.column_id,
-					position,
-					swimlane_id: swimlaneId,
-				}),
-			);
+			await rpc(bc.reg, id, "moveTaskPosition", {
+				project_id: bc.projectId,
+				task_id: params.task_id,
+				column_id: params.column_id,
+				position,
+				swimlane_id: swimlaneId,
+			});
+			return toolResult(`task #${params.task_id} moved to col ${params.column_id} (position ${position}, swimlane ${swimlaneId})`, {
+				task_id: params.task_id,
+				column_id: params.column_id,
+				position,
+				swimlane_id: swimlaneId,
+			});
 		},
 		...toolRenderers("kanban_move_task", summarizeMove),
 	});
@@ -692,7 +892,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "closeTask", { task_id: params.task_id }));
+			const task = await rpc(bc.reg, id, "closeTask", { task_id: params.task_id });
+			return toolResult(`task #${params.task_id} closed`, task);
 		},
 		...toolRenderers("kanban_close_task", summarizeTask),
 	});
@@ -707,7 +908,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "openTask", { task_id: params.task_id }));
+			const task = await rpc(bc.reg, id, "openTask", { task_id: params.task_id });
+			return toolResult(`task #${params.task_id} reopened`, task);
 		},
 		...toolRenderers("kanban_reopen_task", summarizeTask),
 	});
@@ -727,7 +929,7 @@ export default function (pi: ExtensionAPI) {
 				user_id: id.user_id,
 				content: params.content,
 			});
-			return toolResult({ comment_id: commentId });
+			return toolResult(`comment #${commentId} added to task #${params.task_id}`, { comment_id: commentId });
 		},
 		...toolRenderers("kanban_add_comment", summarizeIdResult("comment_id", "added")),
 	});
@@ -742,7 +944,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getAllComments", { task_id: params.task_id }));
+			const comments = await rpc(bc.reg, id, "getAllComments", { task_id: params.task_id });
+			return toolResult(formatResult(comments, formatComments), comments);
 		},
 		...toolRenderers("kanban_list_comments", summarizeComments),
 	});
@@ -757,7 +960,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getComment", { comment_id: params.comment_id }));
+			const comment = await rpc(bc.reg, id, "getComment", { comment_id: params.comment_id });
+			return toolResult(formatResult(comment, formatComment), comment);
 		},
 		...toolRenderers("kanban_get_comment", summarizeComment),
 	});
@@ -784,7 +988,7 @@ export default function (pi: ExtensionAPI) {
 				time_spent: 0,
 				status: 0,
 			});
-			return toolResult({ subtask_id: subtaskId });
+			return toolResult(`subtask #${subtaskId} added to task #${params.task_id}`, { subtask_id: subtaskId });
 		},
 		...toolRenderers("kanban_add_subtask", summarizeIdResult("subtask_id", "added")),
 	});
@@ -799,7 +1003,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getAllSubtasks", { task_id: params.task_id }));
+			const subs = await rpc(bc.reg, id, "getAllSubtasks", { task_id: params.task_id });
+			return toolResult(formatResult(subs, formatSubtaskList), subs);
 		},
 		...toolRenderers("kanban_list_subtasks", summarizeSubtaskList),
 	});
@@ -819,15 +1024,16 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			const sub = (await rpc(bc.reg, id, "getSubtask", { subtask_id: params.subtask_id })) as Record<string, unknown>;
-			const p: Record<string, unknown> = { id: params.subtask_id, task_id: Number(sub.task_id) };
+			const cur = (await rpc(bc.reg, id, "getSubtask", { subtask_id: params.subtask_id })) as Record<string, unknown>;
+			const p: Record<string, unknown> = { id: params.subtask_id, task_id: Number(cur.task_id) };
 			if (params.title !== undefined) p.title = params.title;
 			if (params.time_estimate !== undefined) p.time_estimated = params.time_estimate;
 			if (params.status !== undefined) {
 				const statusMap = { todo: 0, started: 1, done: 2 } as const;
 				p.status = statusMap[params.status];
 			}
-			return toolResult(await rpc(bc.reg, id, "updateSubtask", p));
+			const updated = await rpc(bc.reg, id, "updateSubtask", p);
+			return toolResult(formatResult(updated, formatSubtask), updated);
 		},
 		...toolRenderers("kanban_update_subtask", summarizeSubtask),
 	});
@@ -842,7 +1048,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getColumns", { project_id: bc.projectId }));
+			const columns = await rpc(bc.reg, id, "getColumns", { project_id: bc.projectId });
+			return toolResult(formatResult(columns, formatColumns), columns);
 		},
 		...toolRenderers("kanban_list_columns", summarizeColumns),
 	});
@@ -857,7 +1064,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const bc = resolveBoard(ctx.cwd);
 			const id = resolveIdentity(bc.reg, ctx, ctx.cwd);
-			return toolResult(await rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId }));
+			const swimlanes = await rpc(bc.reg, id, "getActiveSwimlanes", { project_id: bc.projectId });
+			return toolResult(formatResult(swimlanes, formatSwimlanes), swimlanes);
 		},
 		...toolRenderers("kanban_list_swimlanes", summarizeSwimlanes),
 	});
